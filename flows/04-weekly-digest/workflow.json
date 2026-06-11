@@ -1,0 +1,138 @@
+{
+  "name": "04 — Weekly Security Posture Digest",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * 1"
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule — Monday 09:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Sheet1",
+          "mode": "name"
+        },
+        "options": {
+          "returnAllMatches": true
+        }
+      },
+      "id": "sheets-read-all",
+      "name": "Read Full Alert Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [460, 300],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID",
+          "name": "Google Sheets — Security Alerts"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Calculate all weekly metrics from the full alert log\n// Filter to past 7 days, then compute summary statistics\n\nconst allAlerts = $input.all().map(i => i.json);\nconst now = new Date();\nconst sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);\n\n// Filter to past 7 days\nconst weekAlerts = allAlerts.filter(a => {\n  const ingested = new Date(a.ingested_at);\n  return ingested >= sevenDaysAgo;\n});\n\nif (weekAlerts.length === 0) {\n  return [{ json: { _no_data: true, week_start: sevenDaysAgo.toISOString().split('T')[0] } }];\n}\n\n// ── Core counts ────────────────────────────────────────────────\nconst total = weekAlerts.length;\nconst scored = weekAlerts.filter(a => a.scored_at);\nconst truePositives = scored.filter(a => a.triage_decision === 'true_positive');\nconst falsePositives = scored.filter(a => a.triage_decision === 'false_positive');\nconst needsInvestigation = scored.filter(a => a.triage_decision === 'needs_investigation');\n\n// ── Severity breakdown ─────────────────────────────────────────\nconst bySeverity = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };\nweekAlerts.forEach(a => {\n  const sev = (a.severity || 'low').toLowerCase();\n  if (bySeverity.hasOwnProperty(sev)) bySeverity[sev]++;\n});\n\n// ── Mean time to triage (minutes) ─────────────────────────────\nconst triageTimesMinutes = scored\n  .filter(a => a.ingested_at && a.scored_at)\n  .map(a => {\n    const ingest = new Date(a.ingested_at).getTime();\n    const score  = new Date(a.scored_at).getTime();\n    return (score - ingest) / 60000;\n  })\n  .filter(t => t >= 0 && t < 1440); // sanity filter: 0–24 hours\n\nconst mttt = triageTimesMinutes.length > 0\n  ? (triageTimesMinutes.reduce((a, b) => a + b, 0) / triageTimesMinutes.length).toFixed(1)\n  : 'N/A';\n\n// ── Top 3 recurring findings ───────────────────────────────────\nconst titleCounts = {};\nweekAlerts.forEach(a => {\n  if (a.title) {\n    titleCounts[a.title] = (titleCounts[a.title] || 0) + 1;\n  }\n});\n\nconst topFindings = Object.entries(titleCounts)\n  .sort((a, b) => b[1] - a[1])\n  .slice(0, 3)\n  .map(([title, count], i) => ({ rank: i + 1, title, count }));\n\n// ── Open tickets ───────────────────────────────────────────────\nconst openTickets   = weekAlerts.filter(a => a.jira_status === 'open').length;\nconst closedTickets = weekAlerts.filter(a => a.jira_status === 'closed').length;\n\n// ── True positive rate ─────────────────────────────────────────\nconst tpRate = scored.length > 0\n  ? Math.round((truePositives.length / scored.length) * 100)\n  : 0;\n\n// ── Week label ─────────────────────────────────────────────────\nconst weekLabel = sevenDaysAgo.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });\nconst todayLabel = now.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });\n\nconst metrics = {\n  week_label:         `${weekLabel} — ${todayLabel}`,\n  total_alerts:       total,\n  scored_alerts:      scored.length,\n  true_positives:     truePositives.length,\n  false_positives:    falsePositives.length,\n  needs_investigation: needsInvestigation.length,\n  tp_rate_pct:        tpRate,\n  mttt_minutes:       mttt,\n  severity_critical:  bySeverity.critical,\n  severity_high:      bySeverity.high,\n  severity_medium:    bySeverity.medium,\n  severity_low:       bySeverity.low,\n  open_tickets:       openTickets,\n  closed_tickets:     closedTickets,\n  top_finding_1:      topFindings[0] ? `${topFindings[0].title} (${topFindings[0].count})` : '—',\n  top_finding_2:      topFindings[1] ? `${topFindings[1].title} (${topFindings[1].count})` : '—',\n  top_finding_3:      topFindings[2] ? `${topFindings[2].title} (${topFindings[2].count})` : '—',\n  generated_at:       now.toISOString()\n};\n\nreturn [{ json: metrics }];\n"
+      },
+      "id": "calculate-metrics",
+      "name": "Calculate Weekly Metrics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#security-alerts",
+          "mode": "name"
+        },
+        "blocksUi": "=[\n  {\n    \"type\": \"header\",\n    \"text\": { \"type\": \"plain_text\", \"text\": \"📊 Weekly Security Posture Report\" }\n  },\n  {\n    \"type\": \"context\",\n    \"elements\": [{ \"type\": \"mrkdwn\", \"text\": \"Week of {{ $json.week_label }}\" }]\n  },\n  { \"type\": \"divider\" },\n  {\n    \"type\": \"section\",\n    \"fields\": [\n      { \"type\": \"mrkdwn\", \"text\": \"*Total alerts*\\n{{ $json.total_alerts }}\" },\n      { \"type\": \"mrkdwn\", \"text\": \"*True positive rate*\\n{{ $json.tp_rate_pct }}%\" },\n      { \"type\": \"mrkdwn\", \"text\": \"*Open tickets*\\n{{ $json.open_tickets }}\" },\n      { \"type\": \"mrkdwn\", \"text\": \"*Mean time to triage*\\n{{ $json.mttt_minutes }} min\" }\n    ]\n  },\n  { \"type\": \"divider\" },\n  {\n    \"type\": \"section\",\n    \"text\": {\n      \"type\": \"mrkdwn\",\n      \"text\": \"*Severity breakdown*\\n🔴 Critical: {{ $json.severity_critical }}   🟠 High: {{ $json.severity_high }}   🟡 Medium: {{ $json.severity_medium }}   ⚪ Low: {{ $json.severity_low }}\"\n    }\n  },\n  { \"type\": \"divider\" },\n  {\n    \"type\": \"section\",\n    \"text\": {\n      \"type\": \"mrkdwn\",\n      \"text\": \"*Top 3 recurring findings*\\n1. {{ $json.top_finding_1 }}\\n2. {{ $json.top_finding_2 }}\\n3. {{ $json.top_finding_3 }}\"\n    }\n  },\n  { \"type\": \"divider\" },\n  {\n    \"type\": \"section\",\n    \"fields\": [\n      { \"type\": \"mrkdwn\", \"text\": \"*Triage decisions*\" },\n      { \"type\": \"mrkdwn\", \"text\": \"✅ True positive: {{ $json.true_positives }}\\n❌ False positive: {{ $json.false_positives }}\\n🔍 Needs investigation: {{ $json.needs_investigation }}\" }\n    ]\n  },\n  {\n    \"type\": \"actions\",\n    \"elements\": [\n      {\n        \"type\": \"button\",\n        \"text\": { \"type\": \"plain_text\", \"text\": \"View Jira Board\" },\n        \"url\": \"https://YOUR_DOMAIN.atlassian.net/jira/software/projects/SEC/boards\"\n      }\n    ]\n  }\n]",
+        "otherOptions": {}
+      },
+      "id": "slack-digest",
+      "name": "Slack — Weekly Digest",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [900, 180],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack — Security Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "YOUR_EMAIL@example.com",
+        "subject": "=Weekly Security Posture Report — {{ $json.week_label }}",
+        "emailType": "html",
+        "message": "=<!DOCTYPE html><html><head><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1a1a1a;max-width:600px;margin:0 auto;padding:24px}h1{font-size:20px;font-weight:600;margin:0 0 4px}p.sub{color:#666;font-size:13px;margin:0 0 24px}.metric-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:0 0 24px}.metric{background:#f5f5f5;border-radius:8px;padding:14px}.metric-label{font-size:12px;color:#666;margin:0 0 4px}.metric-value{font-size:22px;font-weight:600;margin:0}table{width:100%;border-collapse:collapse;margin:0 0 24px}th{text-align:left;font-size:12px;color:#666;font-weight:500;padding:6px 0;border-bottom:1px solid #e5e5e5}td{padding:8px 0;border-bottom:1px solid #f0f0f0;font-size:14px}.sev-critical{color:#dc2626;font-weight:600}.sev-high{color:#ea580c;font-weight:600}.sev-medium{color:#ca8a04}.footer{font-size:12px;color:#999;margin-top:32px;padding-top:16px;border-top:1px solid #e5e5e5}</style></head><body><h1>Weekly Security Posture Report</h1><p class=\"sub\">{{ $json.week_label }}</p><div class=\"metric-grid\"><div class=\"metric\"><p class=\"metric-label\">Total alerts</p><p class=\"metric-value\">{{ $json.total_alerts }}</p></div><div class=\"metric\"><p class=\"metric-label\">True positive rate</p><p class=\"metric-value\">{{ $json.tp_rate_pct }}%</p></div><div class=\"metric\"><p class=\"metric-label\">Open tickets</p><p class=\"metric-value\">{{ $json.open_tickets }}</p></div><div class=\"metric\"><p class=\"metric-label\">Mean time to triage</p><p class=\"metric-value\">{{ $json.mttt_minutes }} min</p></div></div><table><tr><th>Severity</th><th>Count</th></tr><tr><td class=\"sev-critical\">Critical</td><td>{{ $json.severity_critical }}</td></tr><tr><td class=\"sev-high\">High</td><td>{{ $json.severity_high }}</td></tr><tr><td class=\"sev-medium\">Medium</td><td>{{ $json.severity_medium }}</td></tr><tr><td>Low</td><td>{{ $json.severity_low }}</td></tr></table><h2 style=\"font-size:15px;margin:0 0 12px\">Top 3 recurring findings</h2><ol style=\"margin:0 0 24px;padding-left:20px;line-height:1.8\"><li>{{ $json.top_finding_1 }}</li><li>{{ $json.top_finding_2 }}</li><li>{{ $json.top_finding_3 }}</li></ol><h2 style=\"font-size:15px;margin:0 0 12px\">Triage decisions</h2><table><tr><th>Decision</th><th>Count</th></tr><tr><td>True positive</td><td>{{ $json.true_positives }}</td></tr><tr><td>False positive</td><td>{{ $json.false_positives }}</td></tr><tr><td>Needs investigation</td><td>{{ $json.needs_investigation }}</td></tr></table><p class=\"footer\">Generated by Cloud Security Alert Automation · <a href=\"https://github.com/IshwaryaLakshmiC/cloud-security-alert-automation\">GitHub</a></p></body></html>",
+        "options": {}
+      },
+      "id": "gmail-digest",
+      "name": "Gmail — Weekly Digest Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [900, 420],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "YOUR_GMAIL_CREDENTIAL_ID",
+          "name": "Gmail — Security Digest"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule — Monday 09:00": {
+      "main": [
+        [{ "node": "Read Full Alert Log", "type": "main", "index": 0 }]
+      ]
+    },
+    "Read Full Alert Log": {
+      "main": [
+        [{ "node": "Calculate Weekly Metrics", "type": "main", "index": 0 }]
+      ]
+    },
+    "Calculate Weekly Metrics": {
+      "main": [
+        [
+          { "node": "Slack — Weekly Digest", "type": "main", "index": 0 },
+          { "node": "Gmail — Weekly Digest Email", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "meta": {
+    "templateId": "cloud-security-weekly-digest-v1"
+  },
+  "pinData": {},
+  "versionId": "1.0.0",
+  "triggerCount": 1,
+  "tags": ["security-automation", "reporting", "cloud-security", "portfolio"]
+}

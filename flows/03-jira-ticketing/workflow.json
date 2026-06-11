@@ -1,0 +1,330 @@
+{
+  "name": "03 — Jira Ticket Creation + Deduplication",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 10
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule — Every 10 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Sheet1",
+          "mode": "name"
+        },
+        "options": {
+          "returnAllMatches": true
+        }
+      },
+      "id": "sheets-read",
+      "name": "Read Triaged Alerts",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [460, 300],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID",
+          "name": "Google Sheets — Security Alerts"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "scored-check",
+              "leftValue": "={{ $json.scored_at }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            },
+            {
+              "id": "score-threshold",
+              "leftValue": "={{ $json.risk_score }}",
+              "rightValue": 7,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            },
+            {
+              "id": "no-ticket-yet",
+              "leftValue": "={{ $json.jira_ticket_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "not-false-positive",
+              "leftValue": "={{ $json.triage_decision }}",
+              "rightValue": "false_positive",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "all"
+        }
+      },
+      "id": "filter-actionable",
+      "name": "Filter — Actionable Alerts",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare Jira fields from the triaged alert\n// Map risk score to Jira priority and calculate SLA due date\n\nconst alert = $input.first().json;\n\n// Priority mapping\nfunction scoreToJiraPriority(score) {\n  if (score >= 9) return 'Highest';\n  if (score >= 7) return 'High';\n  if (score >= 5) return 'Medium';\n  if (score >= 3) return 'Low';\n  return 'Lowest';\n}\n\n// SLA due date based on severity\nfunction getDueDate(severity, score) {\n  const now = new Date();\n  if (score >= 9 || severity === 'critical') {\n    // Due today\n    return now.toISOString().split('T')[0];\n  } else if (score >= 7 || severity === 'high') {\n    // Due tomorrow\n    now.setDate(now.getDate() + 1);\n    return now.toISOString().split('T')[0];\n  } else {\n    // Due in 3 days\n    now.setDate(now.getDate() + 3);\n    return now.toISOString().split('T')[0];\n  }\n}\n\n// Build JQL to search for duplicate open tickets\nconst jqlQuery = `project = SEC AND status != Done AND summary ~ \"${alert.resource_id}\" AND labels = \"auto-triaged\" ORDER BY created DESC`;\n\n// Build ticket description\nconst description = [\n  `*Alert Source:* ${alert.source}`,\n  `*Vendor Severity:* ${alert.severity}`,\n  `*AI Risk Score:* ${alert.risk_score}/10`,\n  `*Triage Decision:* ${alert.triage_decision.replace(/_/g, ' ')}`,\n  '',\n  '*AI Triage Rationale:*',\n  alert.triage_rationale,\n  '',\n  '*Resource Details:*',\n  `• Resource ID: ${alert.resource_id}`,\n  `• Resource Type: ${alert.resource_type}`,\n  `• Cloud Account: ${alert.cloud_account}`,\n  `• Region: ${alert.region}`,\n  `• Environment: ${alert.env_tag || 'unknown'}`,\n  `• Owner Team: ${alert.owner_tag || 'untagged'}`,\n  '',\n  '*Timestamps:*',\n  `• Alert detected: ${alert.timestamp}`,\n  `• AI triaged: ${alert.scored_at}`,\n  '',\n  `*Alert ID:* ${alert.alert_id}`,\n  '',\n  '---',\n  '_This ticket was automatically created by the Cloud Security Alert Automation system._',\n  '_Source: [GitHub Repository|https://github.com/IshwaryaLakshmiC/cloud-security-alert-automation]_'\n].join('\\n');\n\nreturn [{\n  json: {\n    ...alert,\n    _jql_query:     jqlQuery,\n    _jira_summary:  `[AUTO] ${alert.source.toUpperCase()} — ${alert.title}`,\n    _jira_priority: scoreToJiraPriority(alert.risk_score),\n    _jira_due_date: getDueDate(alert.severity, alert.risk_score),\n    _jira_labels:   ['auto-triaged', alert.source, alert.env_tag || 'unknown-env'].filter(Boolean),\n    _jira_description: description\n  }\n}];\n"
+      },
+      "id": "prepare-jira-fields",
+      "name": "Prepare Jira Fields",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "returnAll": false,
+        "limit": 1,
+        "options": {
+          "jql": "={{ $json._jql_query }}"
+        }
+      },
+      "id": "jira-search",
+      "name": "Search Jira — Existing Ticket",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [1120, 300],
+      "credentials": {
+        "jiraApi": {
+          "id": "YOUR_JIRA_CREDENTIAL_ID",
+          "name": "Jira — Security Project"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "ticket-exists",
+              "leftValue": "={{ $json.id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "all"
+        }
+      },
+      "id": "ticket-exists-check",
+      "name": "Existing Ticket Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "operation": "issueComment",
+        "issueKey": "={{ $json.key }}",
+        "comment": "=🔄 *Duplicate alert detected — updating existing ticket*\n\n*New alert details:*\n• Alert ID: {{ $('Prepare Jira Fields').first().json.alert_id }}\n• AI Risk Score: {{ $('Prepare Jira Fields').first().json.risk_score }}/10\n• Triage Decision: {{ $('Prepare Jira Fields').first().json.triage_decision }}\n• Detected: {{ $('Prepare Jira Fields').first().json.timestamp }}\n\n*AI Rationale:*\n{{ $('Prepare Jira Fields').first().json.triage_rationale }}\n\n_Automated update — same resource has triggered again._"
+      },
+      "id": "jira-add-comment",
+      "name": "Jira — Add Comment to Existing",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [1560, 180],
+      "credentials": {
+        "jiraApi": {
+          "id": "YOUR_JIRA_CREDENTIAL_ID",
+          "name": "Jira — Security Project"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "additionalFields": {
+          "summary":     "={{ $json._jira_summary }}",
+          "description": "={{ $json._jira_description }}",
+          "priority": {
+            "name": "={{ $json._jira_priority }}"
+          },
+          "labels": "={{ $json._jira_labels }}",
+          "duedate": "={{ $json._jira_due_date }}"
+        },
+        "project": {
+          "key": "SEC"
+        },
+        "issueType": {
+          "name": "Bug"
+        }
+      },
+      "id": "jira-create",
+      "name": "Jira — Create New Ticket",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [1560, 420],
+      "credentials": {
+        "jiraApi": {
+          "id": "YOUR_JIRA_CREDENTIAL_ID",
+          "name": "Jira — Security Project"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Sheet1",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "alert_id":          "={{ $('Prepare Jira Fields').first().json.alert_id }}",
+            "jira_ticket_id":    "={{ $json.key }}",
+            "jira_ticket_url":   "=https://YOUR_DOMAIN.atlassian.net/browse/{{ $json.key }}",
+            "jira_status":       "=open",
+            "ticket_created_at": "={{ new Date().toISOString() }}"
+          },
+          "matchingColumns": ["alert_id"],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "sheets-update-ticket",
+      "name": "Update Sheet — Ticket ID",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1780, 420],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID",
+          "name": "Google Sheets — Security Alerts"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#security-alerts",
+          "mode": "name"
+        },
+        "blocksUi": "=[\n  {\n    \"type\": \"section\",\n    \"text\": {\n      \"type\": \"mrkdwn\",\n      \"text\": \"🎫 *Jira ticket created:* <https://YOUR_DOMAIN.atlassian.net/browse/{{ $('Jira — Create New Ticket').first().json.key }}|{{ $('Jira — Create New Ticket').first().json.key }}> — {{ $('Prepare Jira Fields').first().json._jira_summary }}\\n*Priority:* {{ $('Prepare Jira Fields').first().json._jira_priority }} · *Due:* {{ $('Prepare Jira Fields').first().json._jira_due_date }} · *Owner:* {{ $('Prepare Jira Fields').first().json.owner_tag || 'unassigned' }}\"\n    }\n  }\n]",
+        "otherOptions": {}
+      },
+      "id": "slack-ticket-created",
+      "name": "Slack — Ticket Created",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [2000, 420],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack — Security Bot"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule — Every 10 Minutes": {
+      "main": [
+        [{ "node": "Read Triaged Alerts", "type": "main", "index": 0 }]
+      ]
+    },
+    "Read Triaged Alerts": {
+      "main": [
+        [{ "node": "Filter — Actionable Alerts", "type": "main", "index": 0 }]
+      ]
+    },
+    "Filter — Actionable Alerts": {
+      "main": [
+        [{ "node": "Prepare Jira Fields", "type": "main", "index": 0 }]
+      ]
+    },
+    "Prepare Jira Fields": {
+      "main": [
+        [{ "node": "Search Jira — Existing Ticket", "type": "main", "index": 0 }]
+      ]
+    },
+    "Search Jira — Existing Ticket": {
+      "main": [
+        [{ "node": "Existing Ticket Found?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Existing Ticket Found?": {
+      "main": [
+        [{ "node": "Jira — Add Comment to Existing", "type": "main", "index": 0 }],
+        [{ "node": "Jira — Create New Ticket", "type": "main", "index": 0 }]
+      ]
+    },
+    "Jira — Create New Ticket": {
+      "main": [
+        [
+          { "node": "Update Sheet — Ticket ID", "type": "main", "index": 0 },
+          { "node": "Slack — Ticket Created", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "meta": {
+    "templateId": "cloud-security-jira-ticketing-v1"
+  },
+  "pinData": {},
+  "versionId": "1.0.0",
+  "triggerCount": 1,
+  "tags": ["security-automation", "jira", "deduplication", "cloud-security", "portfolio"]
+}
