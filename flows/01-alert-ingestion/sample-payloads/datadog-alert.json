@@ -1,0 +1,37 @@
+{
+  "id": "dd-signal-AQAAAYmNpQ4AAAAAAAAAAAAAAAA",
+  "name": "Unusual AWS IAM privilege escalation detected",
+  "message": "A user has attached an AdministratorAccess policy to their own IAM role, which may indicate privilege escalation. Investigate immediately.",
+  "timestamp": "2026-06-11T10:44:22Z",
+  "status": "triggered",
+  "priority": "P1",
+  "source_type_name": "amazon_cloudtrail",
+  "host": "iam.amazonaws.com",
+  "org_name": "acme-corp",
+  "tags": [
+    "env:prod",
+    "service:iam",
+    "region:us-west-2",
+    "owner:platform-security",
+    "source:cloudtrail"
+  ],
+  "attributes": {
+    "userIdentity": {
+      "type": "IAMUser",
+      "userName": "svc-deployment-bot",
+      "arn": "arn:aws:iam::123456789012:user/svc-deployment-bot"
+    },
+    "eventName": "AttachUserPolicy",
+    "eventSource": "iam.amazonaws.com",
+    "requestParameters": {
+      "policyArn": "arn:aws:iam::aws:policy/AdministratorAccess",
+      "userName": "svc-deployment-bot"
+    },
+    "sourceIPAddress": "203.0.113.42",
+    "userAgent": "aws-cli/2.13.0"
+  },
+  "rule": {
+    "id": "dd-rule-iam-privilege-escalation",
+    "name": "IAM privilege escalation via policy attachment"
+  }
+}

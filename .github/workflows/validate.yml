@@ -1,0 +1,22 @@
+name: Validate workflow JSON
+
+on:
+  push:
+    paths:
+      - 'flows/**/workflow.json'
+      - 'flows/**/sample-payloads/*.json'
+  pull_request:
+
+jobs:
+  validate-json:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate all JSON files
+        run: |
+          echo "Checking all workflow and payload JSON files..."
+          find flows -name "*.json" | while read f; do
+            python3 -m json.tool "$f" > /dev/null && echo "✓ $f" || { echo "✗ INVALID: $f"; exit 1; }
+          done
+          echo "All JSON files valid."

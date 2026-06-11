@@ -1,0 +1,33 @@
+{
+  "id": "cs-detect-1a2b3c4d5e6f7890abcdef1234567890",
+  "cid": "abcdef1234567890abcdef1234567890",
+  "name": "Mimikatz credential dumping tool detected",
+  "description": "A process matching known Mimikatz signatures was detected attempting to dump LSASS memory.",
+  "timestamp": "2026-06-11T09:15:42Z",
+  "severity": 95,
+  "severity_name": "Critical",
+  "status": "new",
+  "device_id": "ec2-i-0abc123def456789",
+  "account_id": "123456789012",
+  "region": "eu-west-1",
+  "platform": "EC2",
+  "hostname": "prod-app-server-07",
+  "local_ip": "10.0.1.47",
+  "tactic": "Credential Access",
+  "technique": "OS Credential Dumping",
+  "scenario": "suspicious_activity",
+  "tags": {
+    "owner": "backend-team",
+    "env": "prod"
+  },
+  "behaviors": [
+    {
+      "behavior_id": "10064",
+      "filename": "mimikatz.exe",
+      "cmdline": "mimikatz.exe privilege::debug sekurlsa::logonpasswords",
+      "filepath": "C:\\Users\\Public\\mimikatz.exe",
+      "parent_process": "cmd.exe",
+      "sha256": "92cfceb39d57d914ed8b14d0e37643de0797ae56"
+    }
+  ]
+}

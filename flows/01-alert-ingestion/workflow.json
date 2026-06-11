@@ -1,0 +1,214 @@
+{
+  "name": "01 — Alert Ingestion + Normalisation",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "cloud-security-alert-ingest",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook — Alert Ingest",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "cloud-security-alert-ingest"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Source detection ──────────────────────────────────────────\n// Inspect payload structure to identify the alert source\n\nconst payload = $input.first().json.body || $input.first().json;\n\nlet source = 'generic';\n\nif (payload.issueId && payload.entitySnapshot) {\n  source = 'wiz';\n} else if (payload.cid && payload.behaviors) {\n  source = 'crowdstrike';\n} else if (payload.attributes && payload.rule && payload.priority?.startsWith('P')) {\n  source = 'datadog';\n}\n\n// ── Severity mapping helpers ───────────────────────────────────\n\nfunction mapCrowdStrikeSeverity(score) {\n  if (score >= 75) return 'critical';\n  if (score >= 50) return 'high';\n  if (score >= 25) return 'medium';\n  return 'low';\n}\n\nfunction mapDatadogSeverity(priority) {\n  const map = { P1: 'critical', P2: 'high', P3: 'medium', P4: 'low', P5: 'info' };\n  return map[priority] || 'medium';\n}\n\nfunction normaliseWizSeverity(sev) {\n  return (sev || '').toLowerCase();\n}\n\n// ── Normalisation ──────────────────────────────────────────────\n\nlet normalised = {};\n\nif (source === 'wiz') {\n  const snap = payload.entitySnapshot || {};\n  normalised = {\n    alert_id:      payload.issueId,\n    source:        'wiz',\n    severity:      normaliseWizSeverity(payload.severity),\n    title:         payload.control?.name || 'Unknown Wiz Finding',\n    description:   payload.control?.description || '',\n    resource_id:   snap.id || '',\n    resource_type: (snap.type || 'other').toLowerCase().replace('_', ''),\n    cloud_account: snap.subscriptionId || '',\n    region:        snap.region || '',\n    owner_tag:     snap.tags?.owner || '',\n    env_tag:       snap.tags?.env || '',\n    timestamp:     payload.createdAt || new Date().toISOString(),\n    raw_payload:   JSON.stringify(payload)\n  };\n\n} else if (source === 'crowdstrike') {\n  normalised = {\n    alert_id:      payload.id,\n    source:        'crowdstrike',\n    severity:      mapCrowdStrikeSeverity(payload.severity),\n    title:         payload.name || 'Unknown CrowdStrike Detection',\n    description:   payload.description || '',\n    resource_id:   payload.device_id || payload.hostname || '',\n    resource_type: (payload.platform || 'other').toLowerCase(),\n    cloud_account: payload.account_id || '',\n    region:        payload.region || '',\n    owner_tag:     payload.tags?.owner || '',\n    env_tag:       payload.tags?.env || '',\n    timestamp:     payload.timestamp || new Date().toISOString(),\n    raw_payload:   JSON.stringify(payload)\n  };\n\n} else if (source === 'datadog') {\n  const regionTag = (payload.tags || []).find(t => t.startsWith('region:'));\n  const ownerTag  = (payload.tags || []).find(t => t.startsWith('owner:'));\n  const envTag    = (payload.tags || []).find(t => t.startsWith('env:'));\n\n  normalised = {\n    alert_id:      payload.id,\n    source:        'datadog',\n    severity:      mapDatadogSeverity(payload.priority),\n    title:         payload.name || 'Unknown Datadog Signal',\n    description:   payload.message || '',\n    resource_id:   payload.attributes?.userIdentity?.arn || payload.host || '',\n    resource_type: (payload.source_type_name || 'other').toLowerCase(),\n    cloud_account: payload.org_name || '',\n    region:        regionTag ? regionTag.replace('region:', '') : '',\n    owner_tag:     ownerTag  ? ownerTag.replace('owner:', '')   : '',\n    env_tag:       envTag    ? envTag.replace('env:', '')       : '',\n    timestamp:     payload.timestamp || new Date().toISOString(),\n    raw_payload:   JSON.stringify(payload)\n  };\n\n} else {\n  // Generic fallback — pass through what we can\n  normalised = {\n    alert_id:      payload.id || `generic-${Date.now()}`,\n    source:        'generic',\n    severity:      (payload.severity || 'medium').toLowerCase(),\n    title:         payload.title || payload.name || 'Unknown Alert',\n    description:   payload.description || payload.message || '',\n    resource_id:   payload.resource_id || payload.host || '',\n    resource_type: payload.resource_type || 'other',\n    cloud_account: payload.account_id || payload.cloud_account || '',\n    region:        payload.region || '',\n    owner_tag:     payload.tags?.owner || '',\n    env_tag:       payload.tags?.env || '',\n    timestamp:     payload.timestamp || new Date().toISOString(),\n    raw_payload:   JSON.stringify(payload)\n  };\n}\n\n// Add ingestion timestamp\nnormalised.ingested_at = new Date().toISOString();\n\n// Validate required fields\nconst required = ['alert_id', 'source', 'severity', 'title'];\nconst missing  = required.filter(f => !normalised[f]);\n\nif (missing.length > 0) {\n  throw new Error(`Validation failed — missing required fields: ${missing.join(', ')}`);\n}\n\nreturn [{ json: normalised }];\n"
+      },
+      "id": "normalise-code",
+      "name": "Normalise Alert Schema",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "severity-check",
+              "leftValue": "={{ $json.severity }}",
+              "rightValue": "critical",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "severity-high-check",
+              "leftValue": "={{ $json.severity }}",
+              "rightValue": "high",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "any"
+        }
+      },
+      "id": "severity-filter",
+      "name": "Critical or High?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [720, 180]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Sheet1",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "alert_id":      "={{ $json.alert_id }}",
+            "source":        "={{ $json.source }}",
+            "severity":      "={{ $json.severity }}",
+            "title":         "={{ $json.title }}",
+            "resource_id":   "={{ $json.resource_id }}",
+            "resource_type": "={{ $json.resource_type }}",
+            "cloud_account": "={{ $json.cloud_account }}",
+            "region":        "={{ $json.region }}",
+            "owner_tag":     "={{ $json.owner_tag }}",
+            "env_tag":       "={{ $json.env_tag }}",
+            "timestamp":     "={{ $json.timestamp }}",
+            "ingested_at":   "={{ $json.ingested_at }}",
+            "raw_payload":   "={{ $json.raw_payload }}"
+          },
+          "matchingColumns": ["alert_id"],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "sheets-log",
+      "name": "Log to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [960, 300],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID",
+          "name": "Google Sheets — Security Alerts"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#security-alerts",
+          "mode": "name"
+        },
+        "blocksUi": "=[\n  {\n    \"type\": \"header\",\n    \"text\": {\n      \"type\": \"plain_text\",\n      \"text\": \"{{ $json.severity === 'critical' ? '🔴' : '🟠' }} {{ $json.severity | upper }} — {{ $json.title }}\"\n    }\n  },\n  {\n    \"type\": \"section\",\n    \"fields\": [\n      { \"type\": \"mrkdwn\", \"text\": \"*Source:*\\n{{ $json.source | capitalize }}\" },\n      { \"type\": \"mrkdwn\", \"text\": \"*Resource:*\\n`{{ $json.resource_id }}`\" },\n      { \"type\": \"mrkdwn\", \"text\": \"*Account:*\\n{{ $json.cloud_account }}\" },\n      { \"type\": \"mrkdwn\", \"text\": \"*Region:*\\n{{ $json.region }}\" },\n      { \"type\": \"mrkdwn\", \"text\": \"*Owner:*\\n{{ $json.owner_tag || 'untagged' }}\" },\n      { \"type\": \"mrkdwn\", \"text\": \"*Env:*\\n{{ $json.env_tag || 'unknown' }}\" }\n    ]\n  },\n  {\n    \"type\": \"context\",\n    \"elements\": [\n      { \"type\": \"mrkdwn\", \"text\": \"Alert ID: `{{ $json.alert_id }}` · Ingested: {{ $json.ingested_at }}\" }\n    ]\n  }\n]",
+        "otherOptions": {}
+      },
+      "id": "slack-notify",
+      "name": "Slack — Security Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [960, 140],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack — Security Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'accepted', alert_id: $('Normalise Alert Schema').first().json.alert_id, ingested_at: $('Normalise Alert Schema').first().json.ingested_at }) }}",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "id": "response-success",
+      "name": "Response — 202 Accepted",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1200, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'error', message: $input.first().json.message }) }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "response-error",
+      "name": "Response — 400 Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [720, 460]
+    }
+  ],
+  "connections": {
+    "Webhook — Alert Ingest": {
+      "main": [
+        [
+          { "node": "Normalise Alert Schema", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Normalise Alert Schema": {
+      "main": [
+        [
+          { "node": "Critical or High?",   "type": "main", "index": 0 },
+          { "node": "Log to Google Sheets", "type": "main", "index": 0 }
+        ]
+      ],
+      "error": [
+        [
+          { "node": "Response — 400 Error", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Critical or High?": {
+      "main": [
+        [
+          { "node": "Slack — Security Alert", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Log to Google Sheets": {
+      "main": [
+        [
+          { "node": "Response — 202 Accepted", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "meta": {
+    "templateId": "cloud-security-alert-ingestion-v1"
+  },
+  "pinData": {},
+  "versionId": "1.0.0",
+  "triggerCount": 1,
+  "tags": ["security-automation", "cloud-security", "portfolio"]
+}
