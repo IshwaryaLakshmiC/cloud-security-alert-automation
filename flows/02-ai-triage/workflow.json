@@ -1,0 +1,310 @@
+{
+  "name": "02 — AI-Powered Alert Triage + Scoring",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule — Every 5 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Sheet1",
+          "mode": "name"
+        },
+        "options": {
+          "returnAllMatches": true
+        }
+      },
+      "id": "sheets-read",
+      "name": "Read Alert Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [460, 300],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID",
+          "name": "Google Sheets — Security Alerts"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "unscored-check",
+              "leftValue": "={{ $json.scored_at }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "all"
+        }
+      },
+      "id": "filter-unscored",
+      "name": "Filter — Unscored Only",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a structured prompt for LLM triage\n// Injects all relevant alert context so the model has full signal\n\nconst alert = $input.first().json;\n\nconst systemPrompt = `You are a senior cloud security engineer with expertise in AWS, Kubernetes, and enterprise IAM. \nYou are performing alert triage for a security operations team.\n\nYour job is to evaluate each cloud security alert and return a structured JSON triage decision.\n\nEvaluate the alert on these four dimensions:\n1. Blast radius — how many systems, users, or data assets could be affected if this is a real incident\n2. Resource sensitivity — production vs dev/staging, data classification, public-facing vs internal\n3. Attack pattern — does this match a known threat (MITRE ATT&CK TTP, common misconfiguration, known malware)\n4. Exploitability — how easy is this to exploit right now (no additional steps = higher score)\n\nReturn ONLY valid JSON. No preamble, no explanation outside the JSON block.\n\nJSON schema:\n{\n  \"risk_score\": <integer 1-10>,\n  \"triage_decision\": <\"true_positive\" | \"false_positive\" | \"needs_investigation\">,\n  \"triage_rationale\": <2-3 sentences explaining the score and recommended immediate action>\n}\n\nScoring guide:\n- 9-10: Active threat or critical exposure requiring immediate response (< 1 hour)\n- 7-8: High confidence finding requiring same-day response\n- 5-6: Medium confidence, investigate within 48 hours\n- 3-4: Low confidence or low impact, schedule for review\n- 1-2: Likely false positive, verify and close`;\n\nconst userPrompt = `Triage the following cloud security alert:\n\nSource: ${alert.source}\nSeverity (vendor-assigned): ${alert.severity}\nTitle: ${alert.title}\nDescription: ${alert.description}\nResource ID: ${alert.resource_id}\nResource Type: ${alert.resource_type}\nCloud Account: ${alert.cloud_account}\nRegion: ${alert.region}\nEnvironment: ${alert.env_tag || 'unknown'}\nOwner team: ${alert.owner_tag || 'untagged'}\nOriginal timestamp: ${alert.timestamp}`;\n\nreturn [{\n  json: {\n    ...alert,\n    _system_prompt: systemPrompt,\n    _user_prompt: userPrompt\n  }\n}];\n"
+      },
+      "id": "build-prompt",
+      "name": "Build Triage Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "resource": "chat",
+        "operation": "create",
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-4o-mini"
+        },
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "={{ $json._system_prompt }}"
+            },
+            {
+              "role": "user",
+              "content": "={{ $json._user_prompt }}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.1,
+          "maxTokens": 400,
+          "responseFormat": "json_object"
+        }
+      },
+      "id": "openai-triage",
+      "name": "OpenAI — Triage Alert",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1.4,
+      "position": [1120, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI — Security Triage"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the LLM response and merge back with the original alert\n// Handle malformed JSON gracefully — don't let a bad LLM response kill the flow\n\nconst alert = $input.first().json;\nlet triageResult = {};\n\ntry {\n  const rawContent = alert.message?.content || alert.choices?.[0]?.message?.content || '{}';\n  const cleaned = rawContent.replace(/```json|```/g, '').trim();\n  triageResult = JSON.parse(cleaned);\n\n  // Validate fields\n  if (typeof triageResult.risk_score !== 'number') {\n    triageResult.risk_score = 5; // safe default\n  }\n  triageResult.risk_score = Math.min(10, Math.max(1, Math.round(triageResult.risk_score)));\n\n  const validDecisions = ['true_positive', 'false_positive', 'needs_investigation'];\n  if (!validDecisions.includes(triageResult.triage_decision)) {\n    triageResult.triage_decision = 'needs_investigation';\n  }\n\n  if (!triageResult.triage_rationale) {\n    triageResult.triage_rationale = 'Automated triage — manual review recommended.';\n  }\n\n} catch (e) {\n  // Fallback if LLM returns unparseable content\n  triageResult = {\n    risk_score: 5,\n    triage_decision: 'needs_investigation',\n    triage_rationale: `Automated triage failed to parse LLM response. Manual review required. Parse error: ${e.message}`\n  };\n}\n\n// Clean up internal prompt fields before writing back\nconst { _system_prompt, _user_prompt, ...cleanAlert } = alert;\n\nreturn [{\n  json: {\n    ...cleanAlert,\n    risk_score:        triageResult.risk_score,\n    triage_decision:   triageResult.triage_decision,\n    triage_rationale:  triageResult.triage_rationale,\n    scored_at:         new Date().toISOString()\n  }\n}];\n"
+      },
+      "id": "parse-triage",
+      "name": "Parse Triage Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Sheet1",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "alert_id":         "={{ $json.alert_id }}",
+            "risk_score":       "={{ $json.risk_score }}",
+            "triage_decision":  "={{ $json.triage_decision }}",
+            "triage_rationale": "={{ $json.triage_rationale }}",
+            "scored_at":        "={{ $json.scored_at }}"
+          },
+          "matchingColumns": ["alert_id"],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "sheets-update",
+      "name": "Update Triage Result",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1560, 300],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID",
+          "name": "Google Sheets — Security Alerts"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "high-score-check",
+              "leftValue": "={{ $json.risk_score }}",
+              "rightValue": 8,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            },
+            {
+              "id": "true-positive-check",
+              "leftValue": "={{ $json.triage_decision }}",
+              "rightValue": "true_positive",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "all"
+        }
+      },
+      "id": "filter-urgent",
+      "name": "Score ≥ 8 + True Positive?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [1780, 300]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#security-alerts",
+          "mode": "name"
+        },
+        "blocksUi": "=[\n  {\n    \"type\": \"header\",\n    \"text\": {\n      \"type\": \"plain_text\",\n      \"text\": \"🚨 AI Triage: Score {{ $json.risk_score }}/10 — Immediate Action Required\"\n    }\n  },\n  {\n    \"type\": \"section\",\n    \"text\": {\n      \"type\": \"mrkdwn\",\n      \"text\": \"*{{ $json.title }}*\\n{{ $json.triage_rationale }}\"\n    }\n  },\n  {\n    \"type\": \"section\",\n    \"fields\": [\n      { \"type\": \"mrkdwn\", \"text\": \"*Source:*\\n{{ $json.source | capitalize }}\" },\n      { \"type\": \"mrkdwn\", \"text\": \"*Decision:*\\n{{ $json.triage_decision | replace('_', ' ') }}\" },\n      { \"type\": \"mrkdwn\", \"text\": \"*Resource:*\\n`{{ $json.resource_id }}`\" },\n      { \"type\": \"mrkdwn\", \"text\": \"*Environment:*\\n{{ $json.env_tag || 'unknown' }}\" },\n      { \"type\": \"mrkdwn\", \"text\": \"*Owner:*\\n{{ $json.owner_tag || 'untagged' }}\" },\n      { \"type\": \"mrkdwn\", \"text\": \"*Risk Score:*\\n*{{ $json.risk_score }}/10*\" }\n    ]\n  },\n  {\n    \"type\": \"context\",\n    \"elements\": [\n      { \"type\": \"mrkdwn\", \"text\": \"Alert ID: `{{ $json.alert_id }}` · Scored: {{ $json.scored_at }}\" }\n    ]\n  }\n]",
+        "otherOptions": {}
+      },
+      "id": "slack-urgent",
+      "name": "Slack — Urgent Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [2000, 300],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack — Security Bot"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule — Every 5 Minutes": {
+      "main": [
+        [
+          { "node": "Read Alert Log", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Read Alert Log": {
+      "main": [
+        [
+          { "node": "Filter — Unscored Only", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Filter — Unscored Only": {
+      "main": [
+        [
+          { "node": "Build Triage Prompt", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Build Triage Prompt": {
+      "main": [
+        [
+          { "node": "OpenAI — Triage Alert", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "OpenAI — Triage Alert": {
+      "main": [
+        [
+          { "node": "Parse Triage Response", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Parse Triage Response": {
+      "main": [
+        [
+          { "node": "Update Triage Result", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Update Triage Result": {
+      "main": [
+        [
+          { "node": "Score ≥ 8 + True Positive?", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Score ≥ 8 + True Positive?": {
+      "main": [
+        [
+          { "node": "Slack — Urgent Alert", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "meta": {
+    "templateId": "cloud-security-ai-triage-v1"
+  },
+  "pinData": {},
+  "versionId": "1.0.0",
+  "triggerCount": 1,
+  "tags": ["security-automation", "ai-triage", "cloud-security", "portfolio"]
+}
