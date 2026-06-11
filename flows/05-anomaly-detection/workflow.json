@@ -1,0 +1,188 @@
+{
+  "name": "05 — Anomaly Detection (OpenRouter)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "minutes", "minutesInterval": 15 }]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule — Every 15 Min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "Sheet1", "mode": "name" },
+        "options": { "returnAllMatches": true }
+      },
+      "id": "sheets-read",
+      "name": "Read Alert Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [460, 300],
+      "credentials": {
+        "googleSheetsOAuth2Api": { "id": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID", "name": "Google Sheets — Security Alerts" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build 30-day baseline per resource_type + source\n// Then identify new alerts (last 15 min) that deviate from baseline\n\nconst all = $input.all().map(i => i.json);\nconst now = new Date();\nconst fifteenMinAgo = new Date(now.getTime() - 15 * 60 * 1000);\nconst thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);\n\n// Severity numeric weights\nconst sevWeight = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };\n\n// Baseline window: 2 days ago to 15 min ago (exclude the current window)\nconst twoHoursAgo = new Date(now.getTime() - 2 * 60 * 60 * 1000);\nconst baselineAlerts = all.filter(a => {\n  const t = new Date(a.ingested_at);\n  return t >= thirtyDaysAgo && t < twoHoursAgo;\n});\n\n// New alerts: last 15 minutes, not yet anomaly-checked\nconst newAlerts = all.filter(a => {\n  const t = new Date(a.ingested_at);\n  return t >= fifteenMinAgo && !a.anomaly_checked;\n});\n\nif (newAlerts.length === 0) {\n  return [{ json: { _skip: true, reason: 'No new alerts in last 15 minutes' } }];\n}\n\n// Build baseline stats per (resource_type, source) group\nconst baseline = {};\nbaselineAlerts.forEach(a => {\n  const key = `${a.resource_type}__${a.source}`;\n  if (!baseline[key]) baseline[key] = { counts: [], severities: [], total: 0 };\n  baseline[key].total++;\n  baseline[key].severities.push(sevWeight[a.severity] || 1);\n});\n\n// Compute per-group: avg hourly rate + avg severity\nconst baselineHours = 30 * 24;\nObject.keys(baseline).forEach(key => {\n  const b = baseline[key];\n  b.avg_hourly_rate = b.total / baselineHours;\n  b.avg_severity = b.severities.reduce((a, c) => a + c, 0) / (b.severities.length || 1);\n});\n\n// Score each new alert against baseline\nconst results = newAlerts.map(alert => {\n  const key = `${alert.resource_type}__${alert.source}`;\n  const b = baseline[key];\n  const currentSevWeight = sevWeight[alert.severity] || 1;\n\n  let anomaly_score = 0;\n  let anomaly_reasons = [];\n\n  if (!b || b.total < 5) {\n    // Not enough history — flag as unknown baseline\n    anomaly_score = 5;\n    anomaly_reasons.push('Insufficient baseline history for this resource type + source combination');\n  } else {\n    // Severity spike: current severity much higher than baseline avg\n    const sevDelta = currentSevWeight - b.avg_severity;\n    if (sevDelta >= 2) {\n      anomaly_score += 4;\n      anomaly_reasons.push(`Severity spike: ${alert.severity} vs baseline avg ${b.avg_severity.toFixed(1)}`);\n    } else if (sevDelta >= 1) {\n      anomaly_score += 2;\n      anomaly_reasons.push(`Elevated severity vs baseline`);\n    }\n\n    // Count recent alerts for same resource_id in last 2 hours\n    const recentSameResource = all.filter(a => {\n      const t = new Date(a.ingested_at);\n      return a.resource_id === alert.resource_id && t >= twoHoursAgo;\n    }).length;\n\n    if (recentSameResource >= 5) {\n      anomaly_score += 5;\n      anomaly_reasons.push(`Frequency spike: ${recentSameResource} alerts on same resource in 2 hours`);\n    } else if (recentSameResource >= 3) {\n      anomaly_score += 2;\n      anomaly_reasons.push(`Repeated alerts on same resource (${recentSameResource} in 2h)`);\n    }\n\n    // New source never seen before for this resource type\n    if (b.total === 0) {\n      anomaly_score += 3;\n      anomaly_reasons.push('First alert ever from this source for this resource type');\n    }\n  }\n\n  anomaly_score = Math.min(10, anomaly_score);\n\n  return {\n    ...alert,\n    anomaly_score,\n    anomaly_reasons: anomaly_reasons.join('; ') || 'Within normal baseline',\n    is_anomaly: anomaly_score >= 5,\n    anomaly_checked: true,\n    baseline_avg_severity: b ? b.avg_severity.toFixed(2) : 'N/A',\n    baseline_hourly_rate: b ? b.avg_hourly_rate.toFixed(4) : 'N/A'\n  };\n});\n\nreturn results.map(r => ({ json: r }));\n"
+      },
+      "id": "baseline-analysis",
+      "name": "Baseline Analysis",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "id": "skip-check", "leftValue": "={{ $json._skip }}", "rightValue": true, "operator": { "type": "boolean", "operation": "notEquals" } }
+          ],
+          "combinator": "all"
+        }
+      },
+      "id": "skip-filter",
+      "name": "Has New Alerts?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "id": "anomaly-flag", "leftValue": "={{ $json.is_anomaly }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } }
+          ],
+          "combinator": "all"
+        }
+      },
+      "id": "anomaly-filter",
+      "name": "Is Anomaly?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [1100, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "HTTP-Referer", "value": "https://github.com/IshwaryaLakshmiC/cloud-security-alert-automation" },
+            { "name": "X-Title", "value": "Cloud Security Alert Automation" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"mistralai/mistral-7b-instruct:free\",\n  \"temperature\": 0.1,\n  \"max_tokens\": 350,\n  \"response_format\": { \"type\": \"json_object\" },\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a cloud security anomaly analyst. You receive a cloud security alert along with statistical anomaly scores and reasons. Your job is to assess whether this is a genuine behavioural anomaly worth escalating, or a statistical fluke. Return ONLY valid JSON with these fields: { \\\"llm_anomaly_verdict\\\": \\\"confirmed\\\" | \\\"false_alarm\\\" | \\\"monitor\\\", \\\"llm_anomaly_reasoning\\\": \\\"2-3 sentence explanation\\\", \\\"recommended_action\\\": \\\"immediate\\\" | \\\"watch\\\" | \\\"ignore\\\" }\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Alert: {{ $json.title }}\\nSource: {{ $json.source }}\\nSeverity: {{ $json.severity }}\\nResource: {{ $json.resource_id }} ({{ $json.resource_type }})\\nEnvironment: {{ $json.env_tag }}\\nAnomaly score: {{ $json.anomaly_score }}/10\\nStatistical reasons: {{ $json.anomaly_reasons }}\\nBaseline avg severity: {{ $json.baseline_avg_severity }}\\nBaseline hourly rate: {{ $json.baseline_hourly_rate }} alerts/hr\\n\\nIs this a genuine behavioural anomaly?\"\n    }\n  ]\n}",
+        "options": {}
+      },
+      "id": "openrouter-anomaly",
+      "name": "OpenRouter — Anomaly Assessment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1320, 300],
+      "credentials": {
+        "httpHeaderAuth": { "id": "YOUR_OPENROUTER_CREDENTIAL_ID", "name": "OpenRouter API" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst prev = $('Anomaly Filter').first().json;\n\nlet llmResult = {};\ntry {\n  const content = item.choices?.[0]?.message?.content || '{}';\n  llmResult = JSON.parse(content.replace(/```json|```/g, '').trim());\n} catch(e) {\n  llmResult = { llm_anomaly_verdict: 'monitor', llm_anomaly_reasoning: 'Parse error — manual review needed.', recommended_action: 'watch' };\n}\n\nreturn [{ json: {\n  ...prev,\n  llm_anomaly_verdict:    llmResult.llm_anomaly_verdict || 'monitor',\n  llm_anomaly_reasoning:  llmResult.llm_anomaly_reasoning || '',\n  recommended_action:     llmResult.recommended_action || 'watch',\n  anomaly_model:          'mistralai/mistral-7b-instruct:free'\n}}];\n"
+      },
+      "id": "parse-anomaly",
+      "name": "Parse Anomaly Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1540, 300]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "Sheet1", "mode": "name" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "alert_id":              "={{ $json.alert_id }}",
+            "anomaly_score":         "={{ $json.anomaly_score }}",
+            "anomaly_reasons":       "={{ $json.anomaly_reasons }}",
+            "is_anomaly":            "={{ $json.is_anomaly }}",
+            "llm_anomaly_verdict":   "={{ $json.llm_anomaly_verdict }}",
+            "llm_anomaly_reasoning": "={{ $json.llm_anomaly_reasoning }}",
+            "recommended_action":    "={{ $json.recommended_action }}",
+            "anomaly_checked":       "=true",
+            "anomaly_model":         "={{ $json.anomaly_model }}"
+          },
+          "matchingColumns": ["alert_id"],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "sheets-update-anomaly",
+      "name": "Write Anomaly Result",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1760, 300],
+      "credentials": {
+        "googleSheetsOAuth2Api": { "id": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID", "name": "Google Sheets — Security Alerts" }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "id": "confirmed-check", "leftValue": "={{ $json.llm_anomaly_verdict }}", "rightValue": "confirmed", "operator": { "type": "string", "operation": "equals" } }
+          ],
+          "combinator": "all"
+        }
+      },
+      "id": "confirmed-filter",
+      "name": "LLM Confirmed Anomaly?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [1980, 300]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": { "__rl": true, "value": "#security-alerts", "mode": "name" },
+        "blocksUi": "=[\n  { \"type\": \"header\", \"text\": { \"type\": \"plain_text\", \"text\": \"🔍 Behavioural Anomaly Detected\" } },\n  { \"type\": \"section\", \"text\": { \"type\": \"mrkdwn\", \"text\": \"*{{ $json.title }}*\\n{{ $json.llm_anomaly_reasoning }}\" } },\n  { \"type\": \"section\", \"fields\": [\n    { \"type\": \"mrkdwn\", \"text\": \"*Anomaly Score*\\n{{ $json.anomaly_score }}/10\" },\n    { \"type\": \"mrkdwn\", \"text\": \"*Action*\\n{{ $json.recommended_action }}\" },\n    { \"type\": \"mrkdwn\", \"text\": \"*Resource*\\n`{{ $json.resource_id }}`\" },\n    { \"type\": \"mrkdwn\", \"text\": \"*Statistical Reasons*\\n{{ $json.anomaly_reasons }}\" }\n  ]},\n  { \"type\": \"context\", \"elements\": [{ \"type\": \"mrkdwn\", \"text\": \"Model: {{ $json.anomaly_model }} · Alert ID: `{{ $json.alert_id }}`\" }] }\n]",
+        "otherOptions": {}
+      },
+      "id": "slack-anomaly",
+      "name": "Slack — Anomaly Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [2200, 300],
+      "credentials": {
+        "slackApi": { "id": "YOUR_SLACK_CREDENTIAL_ID", "name": "Slack — Security Bot" }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule — Every 15 Min": { "main": [[{ "node": "Read Alert Log", "type": "main", "index": 0 }]] },
+    "Read Alert Log": { "main": [[{ "node": "Baseline Analysis", "type": "main", "index": 0 }]] },
+    "Baseline Analysis": { "main": [[{ "node": "Has New Alerts?", "type": "main", "index": 0 }]] },
+    "Has New Alerts?": { "main": [[{ "node": "Is Anomaly?", "type": "main", "index": 0 }]] },
+    "Is Anomaly?": { "main": [[{ "node": "OpenRouter — Anomaly Assessment", "type": "main", "index": 0 }]] },
+    "OpenRouter — Anomaly Assessment": { "main": [[{ "node": "Parse Anomaly Result", "type": "main", "index": 0 }]] },
+    "Parse Anomaly Result": { "main": [[{ "node": "Write Anomaly Result", "type": "main", "index": 0 }]] },
+    "Write Anomaly Result": { "main": [[{ "node": "LLM Confirmed Anomaly?", "type": "main", "index": 0 }]] },
+    "LLM Confirmed Anomaly?": { "main": [[{ "node": "Slack — Anomaly Alert", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1", "saveManualExecutions": true },
+  "meta": { "templateId": "cloud-security-anomaly-detection-v1" },
+  "tags": ["anomaly-detection", "openrouter", "mistral", "cloud-security", "portfolio"]
+}

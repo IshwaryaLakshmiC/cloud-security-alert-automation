@@ -1,0 +1,165 @@
+{
+  "name": "08 — Automated Remediation Suggestions (OpenRouter)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "minutes", "minutesInterval": 20 }] }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule — Every 20 Min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "Sheet1", "mode": "name" },
+        "options": { "returnAllMatches": true }
+      },
+      "id": "sheets-read",
+      "name": "Read Alert Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [460, 300],
+      "credentials": {
+        "googleSheetsOAuth2Api": { "id": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID", "name": "Google Sheets — Security Alerts" }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "id": "true-positive", "leftValue": "={{ $json.triage_decision }}", "rightValue": "true_positive", "operator": { "type": "string", "operation": "equals" } },
+            { "id": "no-remediation", "leftValue": "={{ $json.remediation_generated }}", "rightValue": "", "operator": { "type": "string", "operation": "equals" } },
+            { "id": "has-ticket", "leftValue": "={{ $json.jira_ticket_id }}", "rightValue": "", "operator": { "type": "string", "operation": "notEquals" } }
+          ],
+          "combinator": "all"
+        }
+      },
+      "id": "filter-needs-remediation",
+      "name": "Filter — Needs Remediation",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "HTTP-Referer", "value": "https://github.com/IshwaryaLakshmiC/cloud-security-alert-automation" },
+            { "name": "X-Title", "value": "Cloud Security Alert Automation" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"mistralai/mistral-7b-instruct:free\",\n  \"temperature\": 0.1,\n  \"max_tokens\": 800,\n  \"response_format\": { \"type\": \"json_object\" },\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a senior cloud security engineer and infrastructure automation expert. Given a confirmed cloud security finding, generate a concrete remediation package. Return ONLY valid JSON with exactly these fields:\\n{\\n  \\\"immediate_fix_cli\\\": \\\"The exact AWS CLI command(s) to fix this right now. Use placeholders like <BUCKET_NAME> where specifics are unknown.\\\",\\n  \\\"terraform_snippet\\\": \\\"A Terraform resource block or data source that prevents this issue via IaC. Well-formatted HCL.\\\",\\n  \\\"estimated_fix_minutes\\\": <integer>,\\n  \\\"production_risk\\\": \\\"low\\\" | \\\"medium\\\" | \\\"high\\\",\\n  \\\"production_risk_reason\\\": \\\"One sentence on why applying this fix could impact production.\\\",\\n  \\\"verification_command\\\": \\\"AWS CLI command to verify the fix was applied correctly.\\\",\\n  \\\"remediation_summary\\\": \\\"2-3 sentences describing what to do and why.\\\"}\\n\\nBe precise and production-aware. Never suggest risky changes without noting the risk.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Generate remediation for this confirmed cloud security finding:\\n\\nTitle: {{ $json.title }}\\nSource: {{ $json.source }}\\nDescription: {{ $json.description }}\\nResource ID: {{ $json.resource_id }}\\nResource Type: {{ $json.resource_type }}\\nCloud Account: {{ $json.cloud_account }}\\nRegion: {{ $json.region }}\\nEnvironment: {{ $json.env_tag || 'unknown' }}\\nRisk Score: {{ $json.risk_score }}/10\\nMITRE TTPs: {{ $json.mitre_ttp_ids || 'N/A' }}\\nAI Triage Rationale: {{ $json.triage_rationale }}\"\n    }\n  ]\n}",
+        "options": {}
+      },
+      "id": "openrouter-remediation",
+      "name": "OpenRouter — Generate Remediation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 300],
+      "credentials": {
+        "httpHeaderAuth": { "id": "YOUR_OPENROUTER_CREDENTIAL_ID", "name": "OpenRouter API" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json;\nconst alert = $('Filter — Needs Remediation').first().json;\n\nlet rem = {};\ntry {\n  const content = raw.choices?.[0]?.message?.content || '{}';\n  rem = JSON.parse(content.replace(/```json|```/g, '').trim());\n} catch(e) {\n  rem = {\n    immediate_fix_cli: '# Remediation generation failed — manual review required',\n    terraform_snippet: '# Terraform snippet unavailable',\n    estimated_fix_minutes: 60,\n    production_risk: 'high',\n    production_risk_reason: 'Could not assess automatically.',\n    verification_command: '# Manual verification required',\n    remediation_summary: 'Automated remediation generation failed. Please review manually.'\n  };\n}\n\nreturn [{ json: {\n  ...alert,\n  remediation_summary:       rem.remediation_summary || '',\n  immediate_fix_cli:         rem.immediate_fix_cli || '',\n  terraform_snippet:         rem.terraform_snippet || '',\n  estimated_fix_minutes:     rem.estimated_fix_minutes || 60,\n  production_risk:           rem.production_risk || 'medium',\n  production_risk_reason:    rem.production_risk_reason || '',\n  verification_command:      rem.verification_command || '',\n  remediation_generated:     new Date().toISOString(),\n  remediation_model:         'mistralai/mistral-7b-instruct:free'\n}}];\n"
+      },
+      "id": "parse-remediation",
+      "name": "Parse Remediation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "Sheet1", "mode": "name" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "alert_id":              "={{ $json.alert_id }}",
+            "remediation_summary":   "={{ $json.remediation_summary }}",
+            "immediate_fix_cli":     "={{ $json.immediate_fix_cli }}",
+            "terraform_snippet":     "={{ $json.terraform_snippet }}",
+            "estimated_fix_minutes": "={{ $json.estimated_fix_minutes }}",
+            "production_risk":       "={{ $json.production_risk }}",
+            "verification_command":  "={{ $json.verification_command }}",
+            "remediation_generated": "={{ $json.remediation_generated }}",
+            "remediation_model":     "={{ $json.remediation_model }}"
+          },
+          "matchingColumns": ["alert_id"],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "sheets-update-remediation",
+      "name": "Write Remediation",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1340, 300],
+      "credentials": {
+        "googleSheetsOAuth2Api": { "id": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID", "name": "Google Sheets — Security Alerts" }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "issueComment",
+        "issueKey": "={{ $json.jira_ticket_id }}",
+        "comment": "=🔧 *Automated Remediation Package — Generated by AI*\n\n*Summary:*\n{{ $json.remediation_summary }}\n\n---\n\n*Immediate fix (AWS CLI):*\n{code:bash}\n{{ $json.immediate_fix_cli }}\n{code}\n\n*Verification command:*\n{code:bash}\n{{ $json.verification_command }}\n{code}\n\n*Terraform (IaC prevention):*\n{code:hcl}\n{{ $json.terraform_snippet }}\n{code}\n\n---\n\n*Estimated fix time:* {{ $json.estimated_fix_minutes }} minutes\n*Production risk:* {{ $json.production_risk | upper }} — {{ $json.production_risk_reason }}\n\n_Generated by Cloud Security Alert Automation · Model: {{ $json.remediation_model }}_"
+      },
+      "id": "jira-add-remediation",
+      "name": "Jira — Add Remediation Comment",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [1560, 180],
+      "credentials": {
+        "jiraApi": { "id": "YOUR_JIRA_CREDENTIAL_ID", "name": "Jira — Security Project" }
+      }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": { "__rl": true, "value": "#security-alerts", "mode": "name" },
+        "blocksUi": "=[\n  { \"type\": \"header\", \"text\": { \"type\": \"plain_text\", \"text\": \"🔧 Remediation Ready: {{ $json.title }}\" } },\n  { \"type\": \"section\", \"text\": { \"type\": \"mrkdwn\", \"text\": \"{{ $json.remediation_summary }}\" } },\n  { \"type\": \"section\", \"fields\": [\n    { \"type\": \"mrkdwn\", \"text\": \"*Estimated fix time*\\n{{ $json.estimated_fix_minutes }} min\" },\n    { \"type\": \"mrkdwn\", \"text\": \"*Production risk*\\n{{ $json.production_risk | upper }}\" },\n    { \"type\": \"mrkdwn\", \"text\": \"*Jira ticket*\\n<https://YOUR_DOMAIN.atlassian.net/browse/{{ $json.jira_ticket_id }}|{{ $json.jira_ticket_id }}>\" },\n    { \"type\": \"mrkdwn\", \"text\": \"*Risk reason*\\n{{ $json.production_risk_reason }}\" }\n  ]},\n  { \"type\": \"section\", \"text\": { \"type\": \"mrkdwn\", \"text\": \"*Quick fix:*\\n```{{ $json.immediate_fix_cli }}```\" } },\n  { \"type\": \"context\", \"elements\": [{ \"type\": \"mrkdwn\", \"text\": \"Model: {{ $json.remediation_model }} · Full Terraform snippet in Jira · Alert: `{{ $json.alert_id }}`\" }] }\n]",
+        "otherOptions": {}
+      },
+      "id": "slack-remediation",
+      "name": "Slack — Remediation Ready",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [1560, 420],
+      "credentials": {
+        "slackApi": { "id": "YOUR_SLACK_CREDENTIAL_ID", "name": "Slack — Security Bot" }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule — Every 20 Min": { "main": [[{ "node": "Read Alert Log", "type": "main", "index": 0 }]] },
+    "Read Alert Log": { "main": [[{ "node": "Filter — Needs Remediation", "type": "main", "index": 0 }]] },
+    "Filter — Needs Remediation": { "main": [[{ "node": "OpenRouter — Generate Remediation", "type": "main", "index": 0 }]] },
+    "OpenRouter — Generate Remediation": { "main": [[{ "node": "Parse Remediation", "type": "main", "index": 0 }]] },
+    "Parse Remediation": { "main": [[{ "node": "Write Remediation", "type": "main", "index": 0 }]] },
+    "Write Remediation": {
+      "main": [[
+        { "node": "Jira — Add Remediation Comment", "type": "main", "index": 0 },
+        { "node": "Slack — Remediation Ready", "type": "main", "index": 0 }
+      ]]
+    }
+  },
+  "settings": { "executionOrder": "v1", "saveManualExecutions": true },
+  "meta": { "templateId": "cloud-security-remediation-v1" },
+  "tags": ["remediation", "terraform", "aws-cli", "openrouter", "mistral", "portfolio"]
+}

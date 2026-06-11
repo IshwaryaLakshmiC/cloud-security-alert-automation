@@ -1,0 +1,209 @@
+{
+  "name": "06 — Multi-Model Consensus Triage (OpenRouter)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "minutes", "minutesInterval": 10 }] }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule — Every 10 Min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "Sheet1", "mode": "name" },
+        "options": { "returnAllMatches": true }
+      },
+      "id": "sheets-read",
+      "name": "Read Alert Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [460, 300],
+      "credentials": {
+        "googleSheetsOAuth2Api": { "id": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID", "name": "Google Sheets — Security Alerts" }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "id": "scored", "leftValue": "={{ $json.scored_at }}", "rightValue": "", "operator": { "type": "string", "operation": "notEquals" } },
+            { "id": "high-risk", "leftValue": "={{ $json.risk_score }}", "rightValue": 7, "operator": { "type": "number", "operation": "gte" } },
+            { "id": "no-consensus", "leftValue": "={{ $json.consensus_verdict }}", "rightValue": "", "operator": { "type": "string", "operation": "equals" } }
+          ],
+          "combinator": "all"
+        }
+      },
+      "id": "filter-for-consensus",
+      "name": "Filter — High Risk, No Consensus Yet",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a shared triage prompt used by both models\nconst a = $input.first().json;\nconst systemPrompt = `You are a senior cloud security engineer performing independent alert triage. Evaluate the alert and return ONLY valid JSON: { \"risk_score\": <1-10>, \"triage_decision\": \"true_positive\" | \"false_positive\" | \"needs_investigation\", \"confidence\": \"high\" | \"medium\" | \"low\", \"rationale\": \"2-3 sentences\" }`;\nconst userPrompt = `Source: ${a.source}\\nSeverity: ${a.severity}\\nTitle: ${a.title}\\nDescription: ${a.description}\\nResource: ${a.resource_id} (${a.resource_type})\\nAccount: ${a.cloud_account} | Region: ${a.region}\\nEnv: ${a.env_tag || 'unknown'} | Owner: ${a.owner_tag || 'untagged'}`;\nreturn [{ json: { ...a, _system_prompt: systemPrompt, _user_prompt: userPrompt } }];\n"
+      },
+      "id": "build-prompt",
+      "name": "Build Shared Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "HTTP-Referer", "value": "https://github.com/IshwaryaLakshmiC/cloud-security-alert-automation" },
+            { "name": "X-Title", "value": "Cloud Security Alert Automation" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"meta-llama/llama-3-8b-instruct:free\",\n  \"temperature\": 0.1,\n  \"max_tokens\": 300,\n  \"response_format\": { \"type\": \"json_object\" },\n  \"messages\": [\n    { \"role\": \"system\", \"content\": \"{{ $json._system_prompt }}\" },\n    { \"role\": \"user\", \"content\": \"{{ $json._user_prompt }}\" }\n  ]\n}",
+        "options": {}
+      },
+      "id": "llm-agent-1",
+      "name": "Agent 1 — Llama 3",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 180],
+      "credentials": {
+        "httpHeaderAuth": { "id": "YOUR_OPENROUTER_CREDENTIAL_ID", "name": "OpenRouter API" }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "HTTP-Referer", "value": "https://github.com/IshwaryaLakshmiC/cloud-security-alert-automation" },
+            { "name": "X-Title", "value": "Cloud Security Alert Automation" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"qwen/qwen2-7b-instruct:free\",\n  \"temperature\": 0.1,\n  \"max_tokens\": 300,\n  \"response_format\": { \"type\": \"json_object\" },\n  \"messages\": [\n    { \"role\": \"system\", \"content\": \"{{ $('Build Shared Prompt').first().json._system_prompt }}\" },\n    { \"role\": \"user\", \"content\": \"{{ $('Build Shared Prompt').first().json._user_prompt }}\" }\n  ]\n}",
+        "options": {}
+      },
+      "id": "llm-agent-2",
+      "name": "Agent 2 — Qwen",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 420],
+      "credentials": {
+        "httpHeaderAuth": { "id": "YOUR_OPENROUTER_CREDENTIAL_ID", "name": "OpenRouter API" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge both agent responses and compute consensus\nconst alert = $('Build Shared Prompt').first().json;\n\nfunction parseAgentResponse(raw) {\n  try {\n    const content = raw.choices?.[0]?.message?.content || '{}';\n    const parsed = JSON.parse(content.replace(/```json|```/g, '').trim());\n    return {\n      risk_score: Math.min(10, Math.max(1, Math.round(parsed.risk_score || 5))),\n      triage_decision: ['true_positive','false_positive','needs_investigation'].includes(parsed.triage_decision) ? parsed.triage_decision : 'needs_investigation',\n      confidence: parsed.confidence || 'medium',\n      rationale: parsed.rationale || ''\n    };\n  } catch(e) {\n    return { risk_score: 5, triage_decision: 'needs_investigation', confidence: 'low', rationale: 'Parse error' };\n  }\n}\n\n// $input gives us both agent outputs via the merge node\nconst items = $input.all();\nconst agent1Raw = items.find(i => i.json._agent === 'llama3')?.json || items[0]?.json;\nconst agent2Raw = items.find(i => i.json._agent === 'qwen')?.json || items[1]?.json;\n\nconst a1 = parseAgentResponse(agent1Raw);\nconst a2 = parseAgentResponse(agent2Raw);\n\n// Consensus logic\nconst scoreDiff = Math.abs(a1.risk_score - a2.risk_score);\nconst decisionsMatch = a1.triage_decision === a2.triage_decision;\nconst avgScore = Math.round((a1.risk_score + a2.risk_score) / 2);\n\nlet consensus_verdict, consensus_status;\n\nif (decisionsMatch && scoreDiff <= 2) {\n  consensus_verdict = a1.triage_decision;\n  consensus_status = 'agreed';\n} else if (!decisionsMatch || scoreDiff >= 3) {\n  consensus_verdict = 'contested';\n  consensus_status = 'disagreed';\n} else {\n  consensus_verdict = 'needs_investigation';\n  consensus_status = 'partial';\n}\n\nreturn [{ json: {\n  ...alert,\n  _system_prompt: undefined,\n  _user_prompt: undefined,\n  agent1_score:      a1.risk_score,\n  agent1_decision:   a1.triage_decision,\n  agent1_confidence: a1.confidence,\n  agent1_rationale:  a1.rationale,\n  agent1_model:      'meta-llama/llama-3-8b-instruct:free',\n  agent2_score:      a2.risk_score,\n  agent2_decision:   a2.triage_decision,\n  agent2_confidence: a2.confidence,\n  agent2_rationale:  a2.rationale,\n  agent2_model:      'qwen/qwen2-7b-instruct:free',\n  consensus_verdict,\n  consensus_status,\n  consensus_avg_score: avgScore,\n  score_divergence:    scoreDiff,\n  consensus_checked_at: new Date().toISOString()\n}}];\n"
+      },
+      "id": "compute-consensus",
+      "name": "Compute Consensus",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1380, 300]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "Sheet1", "mode": "name" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "alert_id":             "={{ $json.alert_id }}",
+            "agent1_score":         "={{ $json.agent1_score }}",
+            "agent1_decision":      "={{ $json.agent1_decision }}",
+            "agent1_model":         "={{ $json.agent1_model }}",
+            "agent2_score":         "={{ $json.agent2_score }}",
+            "agent2_decision":      "={{ $json.agent2_decision }}",
+            "agent2_model":         "={{ $json.agent2_model }}",
+            "consensus_verdict":    "={{ $json.consensus_verdict }}",
+            "consensus_status":     "={{ $json.consensus_status }}",
+            "consensus_avg_score":  "={{ $json.consensus_avg_score }}",
+            "score_divergence":     "={{ $json.score_divergence }}",
+            "consensus_checked_at": "={{ $json.consensus_checked_at }}"
+          },
+          "matchingColumns": ["alert_id"],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "sheets-update-consensus",
+      "name": "Write Consensus Result",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1600, 300],
+      "credentials": {
+        "googleSheetsOAuth2Api": { "id": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID", "name": "Google Sheets — Security Alerts" }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "id": "contested", "leftValue": "={{ $json.consensus_status }}", "rightValue": "disagreed", "operator": { "type": "string", "operation": "equals" } }
+          ],
+          "combinator": "all"
+        }
+      },
+      "id": "contested-filter",
+      "name": "Models Disagreed?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [1820, 300]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": { "__rl": true, "value": "#security-alerts", "mode": "name" },
+        "blocksUi": "=[\n  { \"type\": \"header\", \"text\": { \"type\": \"plain_text\", \"text\": \"⚠️ AI Models Disagree — Human Review Needed\" } },\n  { \"type\": \"section\", \"text\": { \"type\": \"mrkdwn\", \"text\": \"*{{ $json.title }}*\\nTwo AI models returned conflicting triage decisions. Manual analyst review required.\" } },\n  { \"type\": \"section\", \"fields\": [\n    { \"type\": \"mrkdwn\", \"text\": \"*Llama 3 (Agent 1)*\\nScore: {{ $json.agent1_score }}/10\\nDecision: {{ $json.agent1_decision }}\\nConfidence: {{ $json.agent1_confidence }}\" },\n    { \"type\": \"mrkdwn\", \"text\": \"*Qwen (Agent 2)*\\nScore: {{ $json.agent2_score }}/10\\nDecision: {{ $json.agent2_decision }}\\nConfidence: {{ $json.agent2_confidence }}\" }\n  ]},\n  { \"type\": \"section\", \"fields\": [\n    { \"type\": \"mrkdwn\", \"text\": \"*Score divergence*\\n{{ $json.score_divergence }} points\" },\n    { \"type\": \"mrkdwn\", \"text\": \"*Resource*\\n`{{ $json.resource_id }}`\" }\n  ]},\n  { \"type\": \"section\", \"text\": { \"type\": \"mrkdwn\", \"text\": \"*Llama 3 rationale:* {{ $json.agent1_rationale }}\\n\\n*Qwen rationale:* {{ $json.agent2_rationale }}\" } },\n  { \"type\": \"context\", \"elements\": [{ \"type\": \"mrkdwn\", \"text\": \"Alert ID: `{{ $json.alert_id }}` · Avg score: {{ $json.consensus_avg_score }}/10\" }] }\n]",
+        "otherOptions": {}
+      },
+      "id": "slack-contested",
+      "name": "Slack — Contested Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [2040, 300],
+      "credentials": {
+        "slackApi": { "id": "YOUR_SLACK_CREDENTIAL_ID", "name": "Slack — Security Bot" }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule — Every 10 Min": { "main": [[{ "node": "Read Alert Log", "type": "main", "index": 0 }]] },
+    "Read Alert Log": { "main": [[{ "node": "Filter — High Risk, No Consensus Yet", "type": "main", "index": 0 }]] },
+    "Filter — High Risk, No Consensus Yet": { "main": [[{ "node": "Build Shared Prompt", "type": "main", "index": 0 }]] },
+    "Build Shared Prompt": {
+      "main": [[
+        { "node": "Agent 1 — Llama 3", "type": "main", "index": 0 },
+        { "node": "Agent 2 — Qwen", "type": "main", "index": 0 }
+      ]]
+    },
+    "Agent 1 — Llama 3": { "main": [[{ "node": "Compute Consensus", "type": "main", "index": 0 }]] },
+    "Agent 2 — Qwen": { "main": [[{ "node": "Compute Consensus", "type": "main", "index": 1 }]] },
+    "Compute Consensus": { "main": [[{ "node": "Write Consensus Result", "type": "main", "index": 0 }]] },
+    "Write Consensus Result": { "main": [[{ "node": "Models Disagreed?", "type": "main", "index": 0 }]] },
+    "Models Disagreed?": { "main": [[{ "node": "Slack — Contested Alert", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1", "saveManualExecutions": true },
+  "meta": { "templateId": "cloud-security-multi-model-consensus-v1" },
+  "tags": ["multi-model", "consensus", "openrouter", "llama3", "qwen", "portfolio"]
+}

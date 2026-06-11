@@ -1,0 +1,191 @@
+{
+  "name": "07 — Threat Intelligence Enrichment (OpenRouter + MITRE + NVD)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "minutes", "minutesInterval": 20 }] }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule — Every 20 Min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "Sheet1", "mode": "name" },
+        "options": { "returnAllMatches": true }
+      },
+      "id": "sheets-read",
+      "name": "Read Alert Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [460, 300],
+      "credentials": {
+        "googleSheetsOAuth2Api": { "id": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID", "name": "Google Sheets — Security Alerts" }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "id": "true-positive", "leftValue": "={{ $json.triage_decision }}", "rightValue": "true_positive", "operator": { "type": "string", "operation": "equals" } },
+            { "id": "no-intel", "leftValue": "={{ $json.threat_intel_enriched }}", "rightValue": "", "operator": { "type": "string", "operation": "equals" } },
+            { "id": "high-score", "leftValue": "={{ $json.risk_score }}", "rightValue": 6, "operator": { "type": "number", "operation": "gte" } }
+          ],
+          "combinator": "all"
+        }
+      },
+      "id": "filter-true-positives",
+      "name": "Filter — True Positives Only",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://attack.mitre.org/api/search?query={{ encodeURIComponent($json.title + ' ' + $json.resource_type) }}&limit=3",
+        "options": { "timeout": 10000 }
+      },
+      "id": "mitre-search",
+      "name": "MITRE ATT&CK — Search TTPs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 180]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={{ encodeURIComponent($('Filter — True Positives Only').first().json.title) }}&resultsPerPage=3",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "User-Agent", "value": "cloud-security-alert-automation/1.0" }]
+        },
+        "options": { "timeout": 15000 }
+      },
+      "id": "nvd-search",
+      "name": "NVD — Search CVEs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge MITRE + NVD results with the original alert\n// Build a structured threat intel context for the LLM\n\nconst alert = $('Filter — True Positives Only').first().json;\n\n// Parse MITRE results safely\nlet mitreContext = 'No MITRE ATT&CK data returned';\ntry {\n  const mitreRaw = $('MITRE ATT\\u0026CK — Search TTPs').first().json;\n  const techniques = mitreRaw?.hits?.hits || mitreRaw?.results || [];\n  if (techniques.length > 0) {\n    mitreContext = techniques.slice(0, 3).map(t => {\n      const src = t._source || t;\n      return `• ${src.external_id || src.id || 'T????'}: ${src.name || 'Unknown'} — ${(src.description || '').slice(0, 120)}`;\n    }).join('\\n');\n  }\n} catch(e) { mitreContext = `MITRE lookup error: ${e.message}`; }\n\n// Parse NVD CVE results safely\nlet cveContext = 'No CVEs found';\ntry {\n  const nvdRaw = $('NVD — Search CVEs').first().json;\n  const cves = nvdRaw?.vulnerabilities || [];\n  if (cves.length > 0) {\n    cveContext = cves.slice(0, 3).map(v => {\n      const cve = v.cve;\n      const score = cve?.metrics?.cvssMetricV31?.[0]?.cvssData?.baseScore ||\n                    cve?.metrics?.cvssMetricV2?.[0]?.cvssData?.baseScore || 'N/A';\n      const desc = cve?.descriptions?.find(d => d.lang === 'en')?.value || '';\n      return `• ${cve?.id}: CVSS ${score} — ${desc.slice(0, 100)}`;\n    }).join('\\n');\n  }\n} catch(e) { cveContext = `CVE lookup error: ${e.message}`; }\n\nreturn [{ json: {\n  ...alert,\n  _mitre_context: mitreContext,\n  _cve_context: cveContext\n}}];\n"
+      },
+      "id": "merge-intel",
+      "name": "Merge Intel Sources",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "HTTP-Referer", "value": "https://github.com/IshwaryaLakshmiC/cloud-security-alert-automation" },
+            { "name": "X-Title", "value": "Cloud Security Alert Automation" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"qwen/qwen2-7b-instruct:free\",\n  \"temperature\": 0.1,\n  \"max_tokens\": 500,\n  \"response_format\": { \"type\": \"json_object\" },\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a threat intelligence analyst. Given a cloud security alert and raw MITRE ATT&CK + NVD CVE data, produce a structured enrichment. Return ONLY valid JSON: { \\\"mitre_ttp_ids\\\": [\\\"T1234\\\", ...], \\\"mitre_tactic\\\": \\\"string\\\", \\\"related_cves\\\": [\\\"CVE-XXXX-XXXX\\\", ...], \\\"threat_actors\\\": [\\\"string\\\", ...], \\\"detection_gap\\\": \\\"string\\\", \\\"intel_summary\\\": \\\"2-3 sentences\\\" }\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Alert: {{ $json.title }}\\nSource: {{ $json.source }}\\nResource type: {{ $json.resource_type }}\\nDescription: {{ $json.description }}\\n\\nMITRE ATT&CK matches:\\n{{ $json._mitre_context }}\\n\\nRelated CVEs:\\n{{ $json._cve_context }}\\n\\nGenerate threat intelligence enrichment.\"\n    }\n  ]\n}",
+        "options": {}
+      },
+      "id": "openrouter-intel",
+      "name": "OpenRouter — Threat Intel Analysis",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 300],
+      "credentials": {
+        "httpHeaderAuth": { "id": "YOUR_OPENROUTER_CREDENTIAL_ID", "name": "OpenRouter API" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json;\nconst alert = $('Merge Intel Sources').first().json;\n\nlet intel = {};\ntry {\n  const content = raw.choices?.[0]?.message?.content || '{}';\n  intel = JSON.parse(content.replace(/```json|```/g, '').trim());\n} catch(e) {\n  intel = { mitre_ttp_ids: [], mitre_tactic: 'Unknown', related_cves: [], threat_actors: [], detection_gap: 'Parse error', intel_summary: 'Threat intel enrichment failed.' };\n}\n\nreturn [{ json: {\n  ...alert,\n  _mitre_context: undefined,\n  _cve_context: undefined,\n  mitre_ttp_ids:        (intel.mitre_ttp_ids || []).join(', '),\n  mitre_tactic:         intel.mitre_tactic || '',\n  related_cves:         (intel.related_cves || []).join(', '),\n  threat_actors:        (intel.threat_actors || []).join(', '),\n  detection_gap:        intel.detection_gap || '',\n  intel_summary:        intel.intel_summary || '',\n  threat_intel_enriched: new Date().toISOString(),\n  intel_model:           'qwen/qwen2-7b-instruct:free'\n}}];\n"
+      },
+      "id": "parse-intel",
+      "name": "Parse Intel Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 300]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "Sheet1", "mode": "name" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "alert_id":              "={{ $json.alert_id }}",
+            "mitre_ttp_ids":         "={{ $json.mitre_ttp_ids }}",
+            "mitre_tactic":          "={{ $json.mitre_tactic }}",
+            "related_cves":          "={{ $json.related_cves }}",
+            "threat_actors":         "={{ $json.threat_actors }}",
+            "detection_gap":         "={{ $json.detection_gap }}",
+            "intel_summary":         "={{ $json.intel_summary }}",
+            "threat_intel_enriched": "={{ $json.threat_intel_enriched }}",
+            "intel_model":           "={{ $json.intel_model }}"
+          },
+          "matchingColumns": ["alert_id"],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "sheets-update-intel",
+      "name": "Write Threat Intel",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1780, 300],
+      "credentials": {
+        "googleSheetsOAuth2Api": { "id": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID", "name": "Google Sheets — Security Alerts" }
+      }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": { "__rl": true, "value": "#security-alerts", "mode": "name" },
+        "blocksUi": "=[\n  { \"type\": \"header\", \"text\": { \"type\": \"plain_text\", \"text\": \"🕵️ Threat Intel Enriched: {{ $json.title }}\" } },\n  { \"type\": \"section\", \"text\": { \"type\": \"mrkdwn\", \"text\": \"{{ $json.intel_summary }}\" } },\n  { \"type\": \"section\", \"fields\": [\n    { \"type\": \"mrkdwn\", \"text\": \"*MITRE TTPs*\\n{{ $json.mitre_ttp_ids || 'None matched' }}\" },\n    { \"type\": \"mrkdwn\", \"text\": \"*Tactic*\\n{{ $json.mitre_tactic || 'Unknown' }}\" },\n    { \"type\": \"mrkdwn\", \"text\": \"*Related CVEs*\\n{{ $json.related_cves || 'None' }}\" },\n    { \"type\": \"mrkdwn\", \"text\": \"*Threat Actors*\\n{{ $json.threat_actors || 'Unknown' }}\" }\n  ]},\n  { \"type\": \"section\", \"text\": { \"type\": \"mrkdwn\", \"text\": \"*Detection Gap:* {{ $json.detection_gap }}\" } },\n  { \"type\": \"context\", \"elements\": [{ \"type\": \"mrkdwn\", \"text\": \"Model: {{ $json.intel_model }} · Alert: `{{ $json.alert_id }}`\" }] }\n]",
+        "otherOptions": {}
+      },
+      "id": "slack-intel",
+      "name": "Slack — Threat Intel",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [2000, 300],
+      "credentials": {
+        "slackApi": { "id": "YOUR_SLACK_CREDENTIAL_ID", "name": "Slack — Security Bot" }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule — Every 20 Min": { "main": [[{ "node": "Read Alert Log", "type": "main", "index": 0 }]] },
+    "Read Alert Log": { "main": [[{ "node": "Filter — True Positives Only", "type": "main", "index": 0 }]] },
+    "Filter — True Positives Only": {
+      "main": [[
+        { "node": "MITRE ATT&CK — Search TTPs", "type": "main", "index": 0 },
+        { "node": "NVD — Search CVEs", "type": "main", "index": 0 }
+      ]]
+    },
+    "MITRE ATT&CK — Search TTPs": { "main": [[{ "node": "Merge Intel Sources", "type": "main", "index": 0 }]] },
+    "NVD — Search CVEs": { "main": [[{ "node": "Merge Intel Sources", "type": "main", "index": 1 }]] },
+    "Merge Intel Sources": { "main": [[{ "node": "OpenRouter — Threat Intel Analysis", "type": "main", "index": 0 }]] },
+    "OpenRouter — Threat Intel Analysis": { "main": [[{ "node": "Parse Intel Result", "type": "main", "index": 0 }]] },
+    "Parse Intel Result": { "main": [[{ "node": "Write Threat Intel", "type": "main", "index": 0 }]] },
+    "Write Threat Intel": { "main": [[{ "node": "Slack — Threat Intel", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1", "saveManualExecutions": true },
+  "meta": { "templateId": "cloud-security-threat-intel-v1" },
+  "tags": ["threat-intel", "mitre", "nvd", "openrouter", "qwen", "portfolio"]
+}
